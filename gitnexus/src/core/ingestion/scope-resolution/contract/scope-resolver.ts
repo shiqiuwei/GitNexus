@@ -260,6 +260,7 @@ import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { GraphNodeLookup } from '../graph-bridge/node-lookup.js';
 import { LanguageProvider } from '../../language-provider.js';
 import { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+import type { SemanticModel } from '../../model/semantic-model.js';
 
 /** A LinearizeStrategy receives the full ancestor map so C3-style
  *  algorithms (which need to merge each parent's MRO) can implement
@@ -314,7 +315,17 @@ export interface ScopeResolver {
     fromFile: string,
     allFilePaths: ReadonlySet<string>,
     resolutionConfig?: unknown,
-  ): string | null;
+  ): string | readonly string[] | null;
+
+  /**
+   * Enumerate names visible through a wildcard import after the target
+   * module scope has been linked. Languages that do not support
+   * wildcard-style imports leave this undefined.
+   */
+  readonly expandsWildcardTo?: (
+    targetModuleScope: ScopeId,
+    parsedFiles: readonly ParsedFile[],
+  ) => readonly string[];
 
   /**
    * Optional one-shot loader for cross-file import-resolution config
@@ -376,6 +387,26 @@ export interface ScopeResolver {
   ): Map<string /* DefId */, string[] /* ancestor DefIds */>;
 
   /**
+   * Optional parallel MRO that EXCLUDES mixin-like augmentation (e.g., PHP
+   * traits). Returns the inheritance-only ancestor chain — the same kind
+   * of map as `buildMro` but built only from inheritance edges (EXTENDS).
+   *
+   * Used by the shared super-branch dispatch in `receiver-bound-calls`
+   * so that `parent::method()` walks the inheritance chain only, not the
+   * trait-augmented one. PHP semantics: `parent::` explicitly bypasses
+   * traits, even when a composed trait shadows a same-named parent method.
+   *
+   * Languages without mixin-like semantics leave this undefined — callers
+   * fall back to `buildMro`/`mroFor`, which for those languages is already
+   * the inheritance chain.
+   */
+  readonly buildExtendsOnlyMro?: (
+    graph: KnowledgeGraph,
+    parsedFiles: readonly ParsedFile[],
+    nodeLookup: GraphNodeLookup,
+  ) => Map<string /* DefId */, string[] /* ancestor DefIds */>;
+
+  /**
    * Mutate `parsed.localDefs[i].ownerId` to point at the structural
    * owner. Python's rule: methods (Function defs whose parent scope
    * is Class) AND class-body fields (defs in Class scopes) are owned
@@ -383,6 +414,18 @@ export interface ScopeResolver {
    * (e.g., Java inner-class qualification).
    */
   populateOwners(parsed: ParsedFile): void;
+
+  /**
+   * Optional workspace-wide ownership reconciliation for languages whose
+   * member owner can be declared in a different file from the owner type.
+   * Runs after every file has had `populateOwners(parsed)` applied, but
+   * still before `reconcileOwnership`, so stamped ownerIds are copied into
+   * the semantic model registries.
+   */
+  readonly populateWorkspaceOwners?: (
+    parsedFiles: readonly ParsedFile[],
+    ctx: { readonly fileContents: ReadonlyMap<string, string> },
+  ) => void;
 
   /**
    * Recognize a `super(...)`-style receiver text. Python returns
@@ -442,6 +485,46 @@ export interface ScopeResolver {
   readonly collapseMemberCallsByCallerTarget?: boolean;
 
   /**
+   * Allow free-call emission to fall back to a unique workspace-wide
+   * callable match when lexical/import bindings miss. Kept opt-in
+   * because this mirrors legacy resolver behavior for some languages
+   * but is too loose as a default for strict module systems.
+   */
+  readonly allowGlobalFreeCallFallback?: boolean;
+
+  /**
+   * Optional predicate to identify definitions with file-local linkage
+   * (e.g. C `static` functions). When provided, `pickUniqueGlobalCallable`
+   * excludes defs where `isFileLocalDef(def) === true` and the def lives
+   * in a different file from the caller. This prevents the global free-call
+   * fallback from creating CALLS edges to file-local symbols that are
+   * logically invisible from the caller's translation unit.
+   *
+   * Languages without file-local linkage semantics leave this undefined.
+   */
+  readonly isFileLocalDef?: (def: SymbolDefinition) => boolean;
+
+  /**
+   * Optional predicate to gate free-call fallback emission by caller-side
+   * visibility. When provided, `pickUniqueGlobalCallable` rejects candidates
+   * the caller cannot legally reach — e.g., a PHP function in a different
+   * namespace with no `use function` import, which PHP runtime would treat
+   * as `Call to undefined function`. Returning `false` blocks the candidate;
+   * returning `true` allows it; undefined-default keeps current behavior
+   * (no visibility filtering, equivalent to "all candidates visible").
+   *
+   * The hook receives the caller's `ParsedFile` (so it can consult
+   * `parsedImports`, `moduleScope`, etc.) and the candidate `SymbolDefinition`.
+   * The predicate must be pure: same inputs → same answer.
+   *
+   * Languages without namespace-scoped function resolution leave this undefined.
+   */
+  readonly isCallableVisibleFromCaller?: (ctx: {
+    readonly callerParsed: ParsedFile;
+    readonly candidate: SymbolDefinition;
+  }) => boolean;
+
+  /**
    * Optional post-finalize hook to inject cross-file bindings that
    * aren't modeled via explicit imports. Runs after
    * `buildWorkspaceResolutionIndex` and before
@@ -485,4 +568,80 @@ export interface ScopeResolver {
    * level bindings.
    */
   readonly hoistTypeBindingsToModule?: boolean;
+
+  /**
+   * Optional: detect structural (duck-typing) interface implementations.
+   * Languages like Go use structural typing — a struct satisfies an
+   * interface if its method set is a superset, without an explicit
+   * `implements` keyword. Runs after finalize, before resolution passes.
+   * Returns: Map<interface_DefId, implementing_struct_DefId[]>.
+   * Default: undefined (no structural interface detection).
+   */
+  readonly detectInterfaceImplementations?: (
+    parsedFiles: readonly ParsedFile[],
+    indexes: ScopeResolutionIndexes,
+    model: SemanticModel,
+  ) => Map<string, string[]>;
+
+  /**
+   * Optional: mirror typeBindings from namespace-import target modules
+   * into the importer's module scope. Languages like Go use namespace
+   * imports (`import "pkg"`) and need the target package's exported
+   * typeBindings visible in the importer's scope chain for cross-package
+   * return-type resolution (e.g. `x := pkg.NewUser(); x.Save()` needs
+   * `NewUser → User` mirrored from the target package). Runs after
+   * `populateNamespaceSiblings` and before `propagateImportedReturnTypes`
+   * so the SCC-ordered pass sees the mirrored bindings.
+   * Default: undefined (no namespace typeBinding mirroring).
+   */
+  readonly mirrorNamespaceTypeBindings?: (
+    parsedFiles: readonly ParsedFile[],
+    indexes: ScopeResolutionIndexes,
+    workspaceIndex: import('../../scope-resolution/workspace-index.js').WorkspaceResolutionIndex,
+  ) => void;
+
+  /**
+   * Optional: bind for-range loop variables to their element/value types.
+   * Languages like Go need to resolve `for _, v := range m` where `m` is
+   * `map[K]V` — the variable `v` should bind to `V`. Runs after finalize,
+   * before resolution passes. Mutates scope typeBindings via the Map cast
+   * convention (see Invariant I8).
+   * Default: undefined (no range variable binding).
+   */
+  readonly populateRangeBindings?: (
+    parsedFiles: readonly ParsedFile[],
+    indexes: ScopeResolutionIndexes,
+    ctx: {
+      readonly fileContents: ReadonlyMap<string, string>;
+      readonly treeCache?: { get(filePath: string): unknown };
+    },
+  ) => void;
+
+  /**
+   * Optional post-resolution pass: emit CALLS edges for member-call sites
+   * whose receiver cannot be typed by the scope chain (no `TypeRef`).
+   * Dynamically-typed languages with untyped/`mixed`/`Any` parameters use
+   * this hook to recover the call edge via workspace-wide method-name
+   * lookup, mirroring what their legacy resolvers did.
+   *
+   * Runs AFTER `emitReceiverBoundCalls` and BEFORE `emitFreeCallFallback`.
+   * Implementations MUST:
+   *   - Skip sites already in `handledSites` (Invariant I2).
+   *   - Add resolved site keys to `handledSites` before returning.
+   *   - Stay narrow: a unique workspace-wide match is the safe baseline.
+   *     Multi-candidate fallbacks should narrow by arity / argument types
+   *     before emitting to keep false-positive rate bounded.
+   *
+   * Returns the number of edges emitted (for telemetry).
+   *
+   * Default: undefined (no unresolved-receiver fallback).
+   */
+  readonly emitUnresolvedReceiverEdges?: (
+    graph: KnowledgeGraph,
+    scopes: ScopeResolutionIndexes,
+    parsedFiles: readonly ParsedFile[],
+    nodeLookup: GraphNodeLookup,
+    handledSites: Set<string>,
+    model: SemanticModel,
+  ) => number;
 }
